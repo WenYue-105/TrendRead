@@ -2338,6 +2338,51 @@ class ReportGenerator:
             return False
 
     @staticmethod
+    def send_no_new_content_to_pushplus(
+        failed_ids: Optional[List] = None,
+        proxy_url: Optional[str] = None,
+    ) -> bool:
+        """在没有新增标题时发送一条简短的 PushPlus 状态通知。"""
+        token = os.environ.get("PUSHPLUS_TOKEN", CONFIG["PUSHPLUS_TOKEN"])
+        if not token:
+            print("未配置 PUSHPLUS_TOKEN，无法发送无新内容通知")
+            return False
+
+        now = TimeHelper.get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
+        content = f"本次检索未发现新的市场监管相关内容。\n\n检索时间：{now}"
+        if failed_ids:
+            content += f"\n\n注意：{len(failed_ids)} 个来源获取失败，请查看 GitHub Actions 日志。"
+
+        try:
+            response = requests.post(
+                "https://www.pushplus.plus/send",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "token": token,
+                    "title": "TrendRead 市场监管监测 - 无新内容",
+                    "content": content,
+                    "template": "markdown",
+                    "channel": "wechat",
+                },
+                proxies=(
+                    {"http": proxy_url, "https": proxy_url}
+                    if proxy_url
+                    else None
+                ),
+                timeout=30,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if result.get("code") == 200:
+                print("PushPlus 无新内容通知发送成功")
+                return True
+            print(f"PushPlus 无新内容通知发送失败：{result.get('msg')}")
+            return False
+        except Exception as error:
+            print(f"PushPlus 无新内容通知发送出错：{error}")
+            return False
+
+    @staticmethod
     def _send_to_dingtalk(
         webhook_url: str,
         report_data: Dict,
@@ -2744,9 +2789,7 @@ class NewsAnalyzer:
         new_titles = seen_title_store.register_new_titles(matched_results)
         seen_title_store.save()
         if seen_title_store.is_initial_run:
-            # 初始标题只用于建立永久基线，避免把存量内容作为新消息推送。
-            print("已建立永久去重基线，本次不发送存量新闻")
-            new_titles = {}
+            print("已建立永久去重基线，并推送当前命中的新闻")
 
         # 构建标题信息
         time_info = Path(title_file).stem
@@ -2795,7 +2838,9 @@ class NewsAnalyzer:
                     self.proxy_url,
                 )
             else:
-                print("本次没有新增的关键词新闻，跳过推送")
+                ReportGenerator.send_no_new_content_to_pushplus(
+                    failed_ids, self.proxy_url
+                )
         elif CONFIG["ENABLE_NOTIFICATION"] and not has_webhook:
             print("⚠️ 警告：通知功能已启用但未配置webhook URL，将跳过通知发送")
         elif not CONFIG["ENABLE_NOTIFICATION"]:
