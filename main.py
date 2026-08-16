@@ -3,6 +3,7 @@
 import json
 import time
 import random
+import hashlib
 from datetime import datetime
 import webbrowser
 from html import unescape
@@ -21,7 +22,7 @@ CONFIG = {
     "SHOW_VERSION_UPDATE": True,  # 控制显示版本更新提示，改成 False 将不接受新版本提示
     "FEISHU_MESSAGE_SEPARATOR": "━━━━━━━━━━━━━━━━━━━",  # feishu消息分割线
     "REQUEST_INTERVAL": 1000,  # 请求间隔(毫秒)
-    "REPORT_TYPE": "daily",  # 报告类型: "current"|"daily"|"both"
+    "REPORT_TYPE": "current",  # 报告类型: "current"|"daily"|"both"
     "RANK_THRESHOLD": 5,  # 排名高亮阈值
     "USE_PROXY": True,  # 是否启用代理
     "DEFAULT_PROXY": "http://127.0.0.1:10086",
@@ -145,6 +146,63 @@ class FileHelper:
         output_dir = Path("output") / date_folder / subfolder
         FileHelper.ensure_directory_exists(str(output_dir))
         return str(output_dir / filename)
+
+
+class SeenTitleStore:
+    """永久保存已推送标题，防止跨天、跨周重复通知。"""
+
+    def __init__(self, file_path: str = "output/seen_titles.json"):
+        self.path = Path(file_path)
+        self.records = {}
+        self.is_initial_run = not self.path.exists()
+        if not self.is_initial_run:
+            try:
+                with open(self.path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                self.records = data.get("records", {})
+                if not isinstance(self.records, dict):
+                    raise ValueError("records 不是对象")
+            except Exception as error:
+                raise RuntimeError(
+                    f"无法读取永久去重记录 {self.path}，为避免重复推送已停止运行：{error}"
+                )
+
+    @staticmethod
+    def _key(source_id: str, title: str) -> str:
+        normalized_title = " ".join(title.lower().split())
+        raw_key = f"{source_id}\0{normalized_title}".encode("utf-8")
+        return hashlib.sha256(raw_key).hexdigest()
+
+    def register_new_titles(self, results: Dict) -> Dict:
+        """登记候选标题并仅返回此前从未出现过的标题。"""
+        new_titles = {}
+        first_seen_at = TimeHelper.get_beijing_time().isoformat()
+
+        for source_id, titles_data in results.items():
+            for title, title_data in titles_data.items():
+                key = self._key(source_id, title)
+                if key in self.records:
+                    continue
+                self.records[key] = {
+                    "source": source_id,
+                    "title": title,
+                    "first_seen_at": first_seen_at,
+                }
+                new_titles.setdefault(source_id, {})[title] = title_data
+
+        return new_titles
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.path.with_suffix(".tmp")
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            json.dump(
+                {"version": 1, "records": self.records},
+                file,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        temporary_path.replace(self.path)
 
 
 class DataFetcher:
@@ -390,12 +448,23 @@ class DataProcessor:
             return {}
 
         files = sorted([f for f in txt_dir.iterdir() if f.suffix == ".txt"])
-        if len(files) < 2:
-            # 如果只有一个文件（第一次爬取），没有"新增"的概念，返回空字典
+        if not files:
             return {}
 
         latest_file = files[-1]
         latest_titles = DataProcessor._parse_file_titles(latest_file)
+
+        # 当天首次运行时，把当前标题作为初始推送基线。
+        if len(files) == 1:
+            initial_titles = {}
+            for source_name, titles_data in latest_titles.items():
+                source_id = next(
+                    (id_val for id_val, alias in id_to_alias.items() if alias == source_name),
+                    None,
+                )
+                if source_id and titles_data:
+                    initial_titles[source_id] = titles_data
+            return initial_titles
 
         # 汇总历史标题
         historical_titles = {}
@@ -1111,6 +1180,19 @@ class StatisticsCalculator:
 
 class ReportGenerator:
     """报告生成器"""
+
+    @staticmethod
+    def keep_only_new_titles(stats: List[Dict]) -> List[Dict]:
+        """保留本次新出现的标题，供实时通知使用。"""
+        new_stats = []
+        for stat in stats:
+            new_items = [title for title in stat["titles"] if title.get("is_new")]
+            if new_items:
+                new_stat = stat.copy()
+                new_stat["titles"] = new_items
+                new_stat["count"] = len(new_items)
+                new_stats.append(new_stat)
+        return new_stats
 
     @staticmethod
     def generate_html_report(
@@ -2645,7 +2727,26 @@ class NewsAnalyzer:
         title_file = DataProcessor.save_titles_to_file(results, id_to_alias, failed_ids)
         print(f"标题已保存到: {title_file}")
 
-        new_titles = DataProcessor.detect_latest_new_titles(id_to_alias)
+        word_groups, filter_words = DataProcessor.load_frequency_words()
+        matched_results = {}
+        for source_id, titles_data in results.items():
+            matched_titles = {
+                title: title_data
+                for title, title_data in titles_data.items()
+                if StatisticsCalculator._matches_word_groups(
+                    title, word_groups, filter_words
+                )
+            }
+            if matched_titles:
+                matched_results[source_id] = matched_titles
+
+        seen_title_store = SeenTitleStore()
+        new_titles = seen_title_store.register_new_titles(matched_results)
+        seen_title_store.save()
+        if seen_title_store.is_initial_run:
+            # 初始标题只用于建立永久基线，避免把存量内容作为新消息推送。
+            print("已建立永久去重基线，本次不发送存量新闻")
+            new_titles = {}
 
         # 构建标题信息
         time_info = Path(title_file).stem
@@ -2666,8 +2767,6 @@ class NewsAnalyzer:
                     "mobileUrl": mobile_url,
                 }
 
-        word_groups, filter_words = DataProcessor.load_frequency_words()
-
         stats, total_titles = StatisticsCalculator.count_word_frequency(
             results,
             word_groups,
@@ -2684,15 +2783,19 @@ class NewsAnalyzer:
             and has_webhook
             and self.report_type in ["current", "both"]
         ):
-            ReportGenerator.send_to_webhooks(
-                stats,
-                failed_ids,
-                "单次爬取",
-                new_titles,
-                id_to_alias,
-                self.update_info,
-                self.proxy_url,
-            )
+            new_stats = ReportGenerator.keep_only_new_titles(stats)
+            if new_stats:
+                ReportGenerator.send_to_webhooks(
+                    new_stats,
+                    failed_ids,
+                    "单次新增",
+                    new_titles,
+                    id_to_alias,
+                    self.update_info,
+                    self.proxy_url,
+                )
+            else:
+                print("本次没有新增的关键词新闻，跳过推送")
         elif CONFIG["ENABLE_NOTIFICATION"] and not has_webhook:
             print("⚠️ 警告：通知功能已启用但未配置webhook URL，将跳过通知发送")
         elif not CONFIG["ENABLE_NOTIFICATION"]:
