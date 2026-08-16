@@ -2763,7 +2763,7 @@ class NewsAnalyzer:
 
         official_sources = [
             ("samr-news", "市场监管总局·新闻", "https://www.samr.gov.cn/xw/index.html"),
-            ("samr-notices", "市场监管总局·政务公开", "https://www.samr.gov.cn/zw/zfxxgk/fdzdgknr/"),
+            ("samr-notices", "市场监管总局·政务公开", "https://www.samr.gov.cn/zw/index.html"),
             ("beijing-news", "北京市市场监管局·动态", "https://scjgj.beijing.gov.cn/zwxx/scjgdt/"),
             ("beijing-notices", "北京市市场监管局·通知", "https://scjgj.beijing.gov.cn/zwxx/ttgg/"),
             ("beijing-public", "北京市市场监管局·公示公告", "https://scjgj.beijing.gov.cn/zwxx/gs/"),
