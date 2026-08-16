@@ -5,9 +5,12 @@ import time
 import random
 from datetime import datetime
 import webbrowser
+from html import unescape
+from html.parser import HTMLParser
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 import os
+from urllib.parse import urljoin, urlparse
 
 import requests
 import pytz
@@ -32,6 +35,8 @@ CONFIG = {
     "DINGTALK_WEBHOOK_URL": "",
     # 企业微信机器人的 webhook URL
     "WEWORK_WEBHOOK_URL": "",
+    # PushPlus 的消息 Token（通过微信接收推送）
+    "PUSHPLUS_TOKEN": "",
     # Telegram 要填两个
     "TELEGRAM_BOT_TOKEN": "",
     "TELEGRAM_CHAT_ID": "",
@@ -261,6 +266,115 @@ class DataFetcher:
 
         print(f"成功: {list(results.keys())}, 失败: {failed_ids}")
         return results, id_to_alias, failed_ids
+
+
+    def crawl_official_sources(
+        self,
+        sources: List[Tuple[str, str, str]],
+        request_interval: int = CONFIG["REQUEST_INTERVAL"],
+    ) -> Tuple[Dict, Dict, List]:
+        """抓取政府网站栏目页，转换为与热点源一致的数据结构。"""
+        results, id_to_alias, failed_ids = {}, {}, []
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; TrendRead/1.0)",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        proxies = (
+            {"http": self.proxy_url, "https": self.proxy_url}
+            if self.proxy_url
+            else None
+        )
+
+        for index, (source_id, source_name, source_url) in enumerate(sources):
+            id_to_alias[source_id] = source_name
+            try:
+                response = requests.get(
+                    source_url, headers=headers, proxies=proxies, timeout=20
+                )
+                response.raise_for_status()
+                response.encoding = response.apparent_encoding or response.encoding
+                articles = OfficialSourceParser.extract_articles(
+                    response.text, source_url
+                )
+                if not articles:
+                    raise ValueError("未解析到文章链接")
+                results[source_id] = {
+                    title: {"ranks": [rank], "url": url, "mobileUrl": url}
+                    for rank, (title, url) in enumerate(articles, 1)
+                }
+                print(f"获取官方来源 {source_name} 成功，共 {len(articles)} 条")
+            except Exception as error:
+                print(f"获取官方来源 {source_name} 失败: {error}")
+                failed_ids.append(source_id)
+
+            if index < len(sources) - 1:
+                time.sleep(max(50, request_interval) / 1000)
+
+        return results, id_to_alias, failed_ids
+
+
+class OfficialSourceParser(HTMLParser):
+    """只用标准库解析政府栏目页，避免为 Actions 增加新依赖。"""
+
+    IGNORED_TITLES = {
+        "首页", "更多", "下一页", "上一页", "尾页", "通知", "公示公告",
+        "市场监管动态", "政务公开", "返回顶部", "打印", "关闭",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.current_href = None
+        self.current_text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.current_href = dict(attrs).get("href")
+            self.current_text = []
+
+    def handle_data(self, data):
+        if self.current_href is not None:
+            self.current_text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.current_href is not None:
+            title = " ".join("".join(self.current_text).split())
+            self.links.append((title, self.current_href))
+            self.current_href = None
+            self.current_text = []
+
+    @classmethod
+    def extract_articles(cls, document: str, page_url: str) -> List[Tuple[str, str]]:
+        parser = cls()
+        parser.feed(document)
+        page_domain = urlparse(page_url).netloc
+        articles, seen_titles = [], set()
+
+        for raw_title, raw_href in parser.links:
+            if not raw_href:
+                continue
+            title = unescape(raw_title).strip()
+            url = urljoin(page_url, raw_href)
+            parsed_url = urlparse(url)
+            path = parsed_url.path.lower()
+            if (
+                len(title) < 8
+                or title in cls.IGNORED_TITLES
+                or title in seen_titles
+                or parsed_url.scheme not in {"http", "https"}
+                or parsed_url.netloc != page_domain
+                or url.rstrip("/") == page_url.rstrip("/")
+                or raw_href.startswith(("#", "javascript:", "mailto:"))
+                or not any(marker in path for marker in (".html", "/art/", "/content/", "/202"))
+            ):
+                continue
+            seen_titles.add(title)
+            articles.append((title, url))
+            if len(articles) >= 30:
+                break
+
+        return articles
 
 
 class DataProcessor:
@@ -2003,6 +2117,7 @@ class ReportGenerator:
             "DINGTALK_WEBHOOK_URL", CONFIG["DINGTALK_WEBHOOK_URL"]
         )
         wework_url = os.environ.get("WEWORK_WEBHOOK_URL", CONFIG["WEWORK_WEBHOOK_URL"])
+        pushplus_token = os.environ.get("PUSHPLUS_TOKEN", CONFIG["PUSHPLUS_TOKEN"])
         telegram_token = os.environ.get(
             "TELEGRAM_BOT_TOKEN", CONFIG["TELEGRAM_BOT_TOKEN"]
         )
@@ -2028,6 +2143,12 @@ class ReportGenerator:
         if wework_url:
             results["wework"] = ReportGenerator._send_to_wework(
                 wework_url, report_data, report_type, update_info_to_send, proxy_url
+            )
+
+        # 发送到 PushPlus（微信公众号推送）
+        if pushplus_token:
+            results["pushplus"] = ReportGenerator._send_to_pushplus(
+                pushplus_token, report_data, report_type, update_info_to_send, proxy_url
             )
 
         # 发送到Telegram
@@ -2091,6 +2212,47 @@ class ReportGenerator:
                 return False
         except Exception as e:
             print(f"飞书通知发送出错 [{report_type}]：{e}")
+            return False
+
+    @staticmethod
+    def _send_to_pushplus(
+        token: str,
+        report_data: Dict,
+        report_type: str,
+        update_info: Optional[Dict] = None,
+        proxy_url: Optional[str] = None,
+    ) -> bool:
+        """通过 PushPlus 的微信渠道发送 Markdown 通知。"""
+        payload = {
+            "token": token,
+            "title": f"TrendRead 市场监管监测 - {report_type}",
+            "content": ReportGenerator._render_dingtalk_content(
+                report_data, update_info
+            ),
+            "template": "markdown",
+            "channel": "wechat",
+        }
+        proxies = (
+            {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        )
+
+        try:
+            response = requests.post(
+                "https://www.pushplus.plus/send",
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                proxies=proxies,
+                timeout=30,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if result.get("code") == 200:
+                print(f"PushPlus 通知发送成功 [{report_type}]")
+                return True
+            print(f"PushPlus 通知发送失败 [{report_type}]：{result.get('msg')}")
+            return False
+        except Exception as error:
+            print(f"PushPlus 通知发送出错 [{report_type}]：{error}")
             return False
 
     @staticmethod
@@ -2381,6 +2543,7 @@ class NewsAnalyzer:
                 os.environ.get("FEISHU_WEBHOOK_URL", CONFIG["FEISHU_WEBHOOK_URL"]),
                 os.environ.get("DINGTALK_WEBHOOK_URL", CONFIG["DINGTALK_WEBHOOK_URL"]),
                 os.environ.get("WEWORK_WEBHOOK_URL", CONFIG["WEWORK_WEBHOOK_URL"]),
+                os.environ.get("PUSHPLUS_TOKEN", CONFIG["PUSHPLUS_TOKEN"]),
                 (
                     os.environ.get("TELEGRAM_BOT_TOKEN", CONFIG["TELEGRAM_BOT_TOKEN"])
                     and os.environ.get("TELEGRAM_CHAT_ID", CONFIG["TELEGRAM_CHAT_ID"])
@@ -2424,6 +2587,7 @@ class NewsAnalyzer:
                 os.environ.get("FEISHU_WEBHOOK_URL", CONFIG["FEISHU_WEBHOOK_URL"]),
                 os.environ.get("DINGTALK_WEBHOOK_URL", CONFIG["DINGTALK_WEBHOOK_URL"]),
                 os.environ.get("WEWORK_WEBHOOK_URL", CONFIG["WEWORK_WEBHOOK_URL"]),
+                os.environ.get("PUSHPLUS_TOKEN", CONFIG["PUSHPLUS_TOKEN"]),
                 (
                     os.environ.get("TELEGRAM_BOT_TOKEN", CONFIG["TELEGRAM_BOT_TOKEN"])
                     and os.environ.get("TELEGRAM_CHAT_ID", CONFIG["TELEGRAM_CHAT_ID"])
@@ -2461,6 +2625,22 @@ class NewsAnalyzer:
         results, id_to_alias, failed_ids = self.data_fetcher.crawl_websites(
             ids, self.request_interval
         )
+
+        official_sources = [
+            ("samr-news", "市场监管总局·新闻动态", "https://www.samr.gov.cn/xw/sj/"),
+            ("samr-notices", "市场监管总局·通知通告", "https://zwfw.samr.gov.cn/scjg/wyk/tbtg/"),
+            ("beijing-news", "北京市市场监管局·动态", "https://scjgj.beijing.gov.cn/zwxx/scjgdt/"),
+            ("beijing-notices", "北京市市场监管局·通知", "https://scjgj.beijing.gov.cn/zwxx/ttgg/"),
+            ("beijing-public", "北京市市场监管局·公示公告", "https://scjgj.beijing.gov.cn/zwxx/gs/"),
+        ]
+        official_results, official_aliases, official_failed_ids = (
+            self.data_fetcher.crawl_official_sources(
+                official_sources, self.request_interval
+            )
+        )
+        results.update(official_results)
+        id_to_alias.update(official_aliases)
+        failed_ids.extend(official_failed_ids)
 
         title_file = DataProcessor.save_titles_to_file(results, id_to_alias, failed_ids)
         print(f"标题已保存到: {title_file}")
