@@ -385,11 +385,18 @@ class OfficialSourceParser(HTMLParser):
         self.links = []
         self.current_href = None
         self.current_text = []
+        self.current_title_attr = ""
 
     def handle_starttag(self, tag, attrs):
         if tag == "a":
-            self.current_href = dict(attrs).get("href")
+            attributes = dict(attrs)
+            self.current_href = (
+                attributes.get("href")
+                or attributes.get("data-href")
+                or attributes.get("data-url")
+            )
             self.current_text = []
+            self.current_title_attr = attributes.get("title", "")
 
     def handle_data(self, data):
         if self.current_href is not None:
@@ -397,10 +404,11 @@ class OfficialSourceParser(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag == "a" and self.current_href is not None:
-            title = " ".join("".join(self.current_text).split())
+            title = " ".join("".join(self.current_text).split()) or self.current_title_attr
             self.links.append((title, self.current_href))
             self.current_href = None
             self.current_text = []
+            self.current_title_attr = ""
 
     @classmethod
     def extract_articles(cls, document: str, page_url: str) -> List[Tuple[str, str]]:
@@ -2754,8 +2762,8 @@ class NewsAnalyzer:
         )
 
         official_sources = [
-            ("samr-news", "市场监管总局·新闻动态", "https://www.samr.gov.cn/xw/sj/"),
-            ("samr-notices", "市场监管总局·通知通告", "https://zwfw.samr.gov.cn/scjg/wyk/tbtg/"),
+            ("samr-news", "市场监管总局·新闻", "https://www.samr.gov.cn/xw/index.html"),
+            ("samr-notices", "市场监管总局·政务公开", "https://www.samr.gov.cn/zw/zfxxgk/fdzdgknr/"),
             ("beijing-news", "北京市市场监管局·动态", "https://scjgj.beijing.gov.cn/zwxx/scjgdt/"),
             ("beijing-notices", "北京市市场监管局·通知", "https://scjgj.beijing.gov.cn/zwxx/ttgg/"),
             ("beijing-public", "北京市市场监管局·公示公告", "https://scjgj.beijing.gov.cn/zwxx/gs/"),
